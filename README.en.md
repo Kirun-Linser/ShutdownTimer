@@ -1,8 +1,8 @@
-# ShutdownTimer
-
 [English](README.en.md) | [简体中文](README.md)
 
-A lightweight scheduled-shutdown tool for Windows. Dark self-drawn UI, styled after [MemoryCleaner](https://github.com/Kirun-Linser/MemoryCleaner). Two modes: countdown shutdown and scheduled shutdown.
+A lightweight scheduled-shutdown tool for Windows. Dark self-drawn UI. Supports two shutdown modes: countdown shutdown and scheduled shutdown.
+
+Features (to be completed)
 
 ## Features
 

@@ -1,8 +1,8 @@
-# ShutdownTimer
-
 [English](README.en.md) | [简体中文](README.md)
 
-轻量级定时关机工具（Windows）。深色自绘 UI，与 [MemoryCleaner](https://github.com/Kirun-Linser/MemoryCleaner) 统一风格。支持两种关机模式：倒计时关机、定时关机。
+轻量级定时关机工具（Windows）。深色自绘 UI。支持两种关机模式：倒计时关机、定时关机。
+
+功能(待完善)
 
 ## 功能
 
