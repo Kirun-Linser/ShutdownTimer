@@ -7,3 +7,6 @@
 *.bmp
 preview_*
 *.tmp
+
+# 本地备份（勿提交）
+*.bak-*
