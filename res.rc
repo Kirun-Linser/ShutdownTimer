@@ -1,1 +1,27 @@
+1 ICON "shutdowntimer.ico"
 1 24 "shutdowntimer.manifest"
+
+1 VERSIONINFO
+FILEVERSION 0,1,0,0
+PRODUCTVERSION 0,1,0,0
+FILEOS 0x40004L
+FILETYPE 0x1L
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "080404b0"
+    BEGIN
+      VALUE "FileDescription", "定时关机工具（倒计时 / 定时两种模式）"
+      VALUE "FileVersion", "0.1.0.0"
+      VALUE "InternalName", "ShutdownTimer"
+      VALUE "OriginalFilename", "ShutdownTimer.exe"
+      VALUE "ProductName", "ShutdownTimer"
+      VALUE "ProductVersion", "0.1.0.0"
+      VALUE "Comments", "到点自动关机；点击「取消」或按 ESC 结束程序"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x804, 1200
+  END
+END

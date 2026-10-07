@@ -1,16 +1,19 @@
 /*
- * ShutdownTimer v3 - 定时关机工具（深色自绘 UI，与 MemoryCleaner 统一风格）
+ * ShutdownTimer - 定时关机工具（深色自绘 UI，与 Castling 统一风格）
  * 双模式：倒计时（小时+分钟） / 定时（HH:MM）
  * 像素制 DPI 缩放（MulDiv(px, scale, 100)）；坐标基于窗口宽高百分比自适应
  * 编译：gcc -mwindows -municode -O2 -static -specs=gcc_shutdowntimer.specs \
- *       -o ShutdownTimer.exe main.c res.o
+ *       -o ShutdownTimer.exe main.c res.o -lgdiplus -lshell32
+ * v0.1.0: 改用分层窗口 + GDI+ 抗锯齿圆角（与 Castling 同一方案）；补图标与版本信息
  */
 #include <windows.h>
+#include <shellapi.h>
+#include <gdiplus.h>
 #include <wchar.h>
 #include <stdio.h>
 #include <time.h>
 
-/* ===== 配色（与 MemoryCleaner 规范一致） ===== */
+/* ===== 配色（与 Castling 规范一致） ===== */
 #define COL_BG      RGB(0x0B, 0x0D, 0x12)   /* 背景 */
 #define COL_CARD    RGB(0x14, 0x17, 0x1F)   /* 卡片 */
 #define COL_CARD_HI RGB(0x1C, 0x21, 0x2C)   /* 卡片 hover */
@@ -20,7 +23,7 @@
 #define COL_HINT    RGB(0x75, 0x7D, 0x8F)   /* 弱提示 */
 #define COL_BTN     RGB(0x3D, 0x7B, 0xFF)   /* 主按钮 */
 #define COL_BTN_HI  RGB(0x5B, 0x90, 0xFF)   /* 主按钮 hover */
-#define COL_EDGE    RGB(0x11, 0x28, 0x5C)   /* 边框蓝 / 输入焦点 */
+#define COL_EDGE    RGB(0x2D, 0x5A, 0xB8)   /* 边框蓝 / 输入焦点（v0.1.0 提亮） */
 #define COL_WHITE   RGB(0xFF, 0xFF, 0xFF)
 
 #define ID_TIMER 2001
@@ -38,6 +41,10 @@ static int       focusBox = 0;   /* 0=无 1=小时 2=分钟 3=时间点 */
 static wchar_t   bufH[4] = L"0", bufM[4] = L"30", bufT[5] = L"2300";
 static HFONT     fTitle, fBtn, fBig, fSub, fInput;
 static int       g_scale;   /* DPI 缩放百分比 */
+static int       g_radius;  /* 圆角半径（随 DPI 缩放） */
+
+/* 前向声明：RenderWindow 定义在 paint() 之后，但更早的函数也要调用 */
+static void RenderWindow(HWND hwnd);
 
 /* 界面常量（百分比 / 基字高） */
 #define PAD_DIV     20      /* pad = W/20 */
@@ -49,6 +56,14 @@ static int       g_scale;   /* DPI 缩放百分比 */
 #define BTN_Y_PCT   80      /* 按钮行 top */
 #define BTN_W_PCT   36      /* 按钮宽 = 可用宽*36%（等宽两枚） */
 #define BTN_H       44      /* 按钮高 44px（像素制） */
+
+/* 输入区几何常量（绘制与命中共用，避免两处硬编码不同步） */
+#define IN_BW_SMALL 62      /* 小时/分钟 输入框宽 */
+#define IN_BW_BIG   96      /* 时间点 输入框宽 */
+#define IN_BH       36      /* 输入框高 */
+#define IN_H_OFF    50      /* 小时框 x = pad + 此值 */
+#define IN_M_OFF    172     /* 分钟框 x */
+#define IN_T_OFF    100     /* 时间点框 x */
 
 static HFONT MakeFont(int px, int weight) {
     return CreateFontW(-MulDiv(px, g_scale, 100), 0, 0, 0, weight, 0, 0, 0,
@@ -118,8 +133,12 @@ static void input_backspace(void) {
 }
 
 /* ===== 任务 ===== */
-static void do_shutdown(void) { system("shutdown /s /t 10"); }
-static void do_cancel(void)    { system("shutdown /a"); }
+/* 隐藏窗口执行系统 shutdown 命令（原用 system() 会闪出控制台黑框） */
+static void run_hidden(const wchar_t *args) {
+    ShellExecuteW(NULL, L"open", L"shutdown", args, NULL, SW_HIDE);
+}
+static void do_shutdown(void) { run_hidden(L"/s /t 10"); }
+static void do_cancel(void)   { run_hidden(L"/a"); }
 
 static int  start_task(HWND hwnd) {   /* 返回 1=已启动 */
     long long now = (long long)time(NULL);
@@ -140,7 +159,7 @@ static int  start_task(HWND hwnd) {   /* 返回 1=已启动 */
     running = 1;
     focusBox = 0;
     SetTimer(hwnd, ID_TIMER, 1000, NULL);
-    InvalidateRect(hwnd, NULL, TRUE);
+    RenderWindow(hwnd);
     return 1;
 }
 static void cancel_task(HWND hwnd) {
@@ -149,7 +168,7 @@ static void cancel_task(HWND hwnd) {
         KillTimer(hwnd, ID_TIMER);
         do_cancel();   /* 取消系统关机任务 */
     }
-    InvalidateRect(hwnd, NULL, TRUE);
+    RenderWindow(hwnd);
 }
 /* “取消”/ESC：中止任务并显示“任务已终止”，约 2s 后自动退出程序。 */
 static void cancel_exit(HWND hwnd) {
@@ -158,7 +177,7 @@ static void cancel_exit(HWND hwnd) {
     exiting = 1;
     exit_at = (long long)time(NULL) + 2;
     SetTimer(hwnd, ID_TIMER, 500, NULL);     /* 每 0.5s check，到点退出 */
-    InvalidateRect(hwnd, NULL, TRUE);
+    RenderWindow(hwnd);
 }
 
 /* ===== 绘制 ===== */
@@ -210,19 +229,19 @@ static void paint(HWND hwnd, HDC dc) {
 
     /* ---- 输入区 ---- */
     {
-        int bh = 36, iy = inputY;
+        int bh = IN_BH, iy = inputY;
         if (mode == MODE_COUNT) {
-            int bw = 62, bx = pad + 50;
+            int bw = IN_BW_SMALL, bx = pad + IN_H_OFF;
             TextLeft(dc, L"小时", pad, iy + 6, 46, 29, fSub, COL_HINT);
             int f1 = (focusBox == 1);
             DrawRoundRect(dc, bx, iy, bw, bh, 6, f1 ? COL_EDGE : COL_CARD);
             DrawRectText(dc, bufH, bx, iy, bw, bh, fInput, f1 ? COL_BLUE : COL_TITLE, DT_CENTER);
             TextLeft(dc, L"分钟", pad + 122, iy + 6, 46, 29, fSub, COL_HINT);
             int f2 = (focusBox == 2);
-            DrawRoundRect(dc, pad + 172, iy, bw, bh, 6, f2 ? COL_EDGE : COL_CARD);
-            DrawRectText(dc, bufM, pad + 172, iy, bw, bh, fInput, f2 ? COL_BLUE : COL_TITLE, DT_CENTER);
+            DrawRoundRect(dc, pad + IN_M_OFF, iy, bw, bh, 6, f2 ? COL_EDGE : COL_CARD);
+            DrawRectText(dc, bufM, pad + IN_M_OFF, iy, bw, bh, fInput, f2 ? COL_BLUE : COL_TITLE, DT_CENTER);
         } else {
-            int bw = 96, bx = pad + 100;
+            int bw = IN_BW_BIG, bx = pad + IN_T_OFF;
             TextLeft(dc, L"时间点", pad, iy + 6, 96, 29, fSub, COL_HINT);
             int f3 = (focusBox == 3);
             DrawRoundRect(dc, bx, iy, bw, bh, 6, f3 ? COL_EDGE : COL_CARD);
@@ -259,35 +278,112 @@ static void paint(HWND hwnd, HDC dc) {
         if (hoverCancel) TextCenter(dc, L"结束程序（或按 ESC）", btnY + bh + 6, Wd, 26, fSub, COL_HINT);
     }
 
-    /* ---- 深蓝色细描边（同 MemoryCleaner 风格） ---- */
-    {
-        int ew = g_scale / 100; if (ew < 1) ew = 1;
-        HPEN edgePen = CreatePen(PS_SOLID, ew, COL_EDGE);
-        HGDIOBJ oldPen = SelectObject(dc, edgePen);
-        HGDIOBJ oldBr  = SelectObject(dc, GetStockObject(NULL_BRUSH));
-        RoundRect(dc, 2, 2, Wd - 2, Hd - 2, 40, 40);
-        SelectObject(dc, oldPen); SelectObject(dc, oldBr);
-        DeleteObject(edgePen);
-    }
 }
+
+/* ===== 分层窗口渲染：GDI+ 抗锯齿圆角 ===== */
+
+/* 构建圆角矩形路径（半径 r，起点 x,y，宽 w 高 h） */
+static void MakeRoundRectPath(GpPath **out, int x, int y, int w, int h, int r) {
+    GpPath *p = NULL;
+    REAL d = (REAL)(r * 2);
+    GdipCreatePath(FillModeAlternate, &p);
+    GdipAddPathArc(p, (REAL)x, (REAL)y, d, d, 180.0f, 90.0f);
+    GdipAddPathArc(p, (REAL)(x + w) - d, (REAL)y, d, d, 270.0f, 90.0f);
+    GdipAddPathArc(p, (REAL)(x + w) - d, (REAL)(y + h) - d, d, d, 0.0f, 90.0f);
+    GdipAddPathArc(p, (REAL)x, (REAL)(y + h) - d, d, d, 90.0f, 90.0f);
+    GdipClosePathFigure(p);
+    *out = p;
+}
+
+/* 整窗渲染：内容走 paint()，圆角由 GDI+ 遮罩提供 alpha，按预乘 alpha 提交给分层窗口 */
+static void RenderWindow(HWND hwnd) {
+    RECT rc; GetClientRect(hwnd, &rc);
+    int W = rc.right, H = rc.bottom;
+    if (W <= 0 || H <= 0) return;
+    if (!fTitle) return;   /* 字体未初始化（如 -selftest 路径）则跳过渲染 */
+    int stride = W * 4, R = g_radius;
+    if (R * 2 > W) R = W / 2;
+    if (R * 2 > H) R = H / 2;
+    HDC screen = GetDC(NULL), mem = CreateCompatibleDC(screen);
+    BITMAPINFO bi; ZeroMemory(&bi, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = W;
+    bi.bmiHeader.biHeight = -H;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    void *bits = NULL, *mk = NULL;
+    HBITMAP dib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+    HBITMAP mdib = CreateDIBSection(screen, &bi, DIB_RGB_COLORS, &mk, NULL, 0);
+    if (!dib || !mdib || !bits || !mk) {
+        if (dib) DeleteObject(dib);
+        if (mdib) DeleteObject(mdib);
+        DeleteDC(mem); ReleaseDC(NULL, screen);
+        return;
+    }
+    HGDIOBJ ob = SelectObject(mem, dib);
+    paint(hwnd, mem);
+    {   /* 抗锯齿圆角描边（路径内缩半个线宽，避免被窗口边界裁掉） */
+        GpGraphics *g = NULL;
+        if (GdipCreateFromHDC(mem, &g) == 0 && g) {
+            GpPath *path = NULL; GpPen *pen = NULL;
+            MakeRoundRectPath(&path, 1, 1, W - 2, H - 2, R);
+            GdipCreatePen1(0xFF2D5AB8u, 1.6f, UnitPixel, &pen);
+            GdipSetSmoothingMode(g, SmoothingModeAntiAlias);
+            GdipSetPixelOffsetMode(g, PixelOffsetModeHighQuality);
+            if (pen) { GdipDrawPath(g, pen, path); GdipDeletePen(pen); }
+            GdipDeletePath(path);
+            GdipDeleteGraphics(g);
+        }
+    }
+    SelectObject(mem, ob);
+    {   /* 圆角遮罩：只取 alpha 通道 */
+        memset(mk, 0, (size_t)stride * H);
+        HDC mdc = CreateCompatibleDC(screen);
+        HGDIOBJ om = SelectObject(mdc, mdib);
+        GpGraphics *g2 = NULL;
+        if (GdipCreateFromHDC(mdc, &g2) == 0 && g2) {
+            GpPath *path = NULL; GpSolidFill *br = NULL;
+            GdipSetSmoothingMode(g2, SmoothingModeAntiAlias);
+            GdipSetPixelOffsetMode(g2, PixelOffsetModeHighQuality);
+            MakeRoundRectPath(&path, 0, 0, W, H, R);
+            GdipCreateSolidFill(0xFFFFFFFFu, &br);
+            if (br) { GdipFillPath(g2, br, path); GdipDeleteBrush(br); }
+            GdipDeletePath(path);
+            GdipDeleteGraphics(g2);
+        }
+        SelectObject(mdc, om); DeleteDC(mdc);
+    }
+    {   /* 合成 + 预乘 */
+        BYTE *op = (BYTE*)bits, *mp = (BYTE*)mk;
+        int i, n = W * H;
+        for (i = 0; i < n; i++) {
+            unsigned a = mp[i * 4 + 3];
+            op[i * 4 + 0] = (BYTE)(op[i * 4 + 0] * a / 255);
+            op[i * 4 + 1] = (BYTE)(op[i * 4 + 1] * a / 255);
+            op[i * 4 + 2] = (BYTE)(op[i * 4 + 2] * a / 255);
+            op[i * 4 + 3] = (BYTE)a;
+        }
+    }
+    {   /* 提交（pptDst 传 NULL = 保持窗口当前位置） */
+        HDC sdc = CreateCompatibleDC(screen);
+        HGDIOBJ os = SelectObject(sdc, dib);
+        BLENDFUNCTION bf; SIZE sz; POINT sp;
+        bf.BlendOp = AC_SRC_OVER; bf.BlendFlags = 0;
+        bf.SourceConstantAlpha = 255; bf.AlphaFormat = AC_SRC_ALPHA;
+        sz.cx = W; sz.cy = H; sp.x = 0; sp.y = 0;
+        UpdateLayeredWindow(hwnd, screen, NULL, &sz, sdc, &sp, 0, &bf, ULW_ALPHA);
+        SelectObject(sdc, os); DeleteDC(sdc);
+    }
+    DeleteObject(dib); DeleteObject(mdib);
+    DeleteDC(mem); ReleaseDC(NULL, screen);
+}
+
 
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
     case WM_ERASEBKGND: return 1;
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC dc = BeginPaint(hwnd, &ps);
-        RECT rc; GetClientRect(hwnd, &rc);
-        HDC mem = CreateCompatibleDC(dc);
-        HBITMAP bm = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
-        HGDIOBJ ob = SelectObject(mem, bm);
-        paint(hwnd, mem);
-        BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
-        SelectObject(mem, ob);
-        DeleteObject(bm); DeleteDC(mem);
-        EndPaint(hwnd, &ps);
-        return 0;
-    }
+    case WM_PAINT: RenderWindow(hwnd); ValidateRect(hwnd, NULL); return 0;
     case WM_LBUTTONDOWN: {
         if (exiting) return 0;
         int x = (short)LOWORD(lParam), y = (short)HIWORD(lParam);
@@ -299,8 +395,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         if (!running) {
             int mw = Wd2 / 2 - pad * 2;
-            if (in_rect(x, y, pad + pad / 2, modeY, mw, modeH)) { mode = MODE_COUNT; focusBox = 0; InvalidateRect(hwnd, NULL, TRUE); return 0; }
-            if (in_rect(x, y, Wd2 / 2 + pad / 2, modeY, mw, modeH)) { mode = MODE_AT; focusBox = 0; InvalidateRect(hwnd, NULL, TRUE); return 0; }
+            if (in_rect(x, y, pad + pad / 2, modeY, mw, modeH)) { mode = MODE_COUNT; focusBox = 0; RenderWindow(hwnd); return 0; }
+            if (in_rect(x, y, Wd2 / 2 + pad / 2, modeY, mw, modeH)) { mode = MODE_AT; focusBox = 0; RenderWindow(hwnd); return 0; }
         }
         {   /* 开始 */
             if (!running && in_rect(x, y, pad, btnY, btnW, bh)) { start_task(hwnd); return 0; }
@@ -308,16 +404,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         }
         {   /* 输入区聚焦 */
             if (mode == MODE_COUNT) {
-                int bw = 62, bh2 = 36;
-                focusBox = in_rect(x, y, pad + 50, inputY, bw, bh2) ? 1
-                         : (in_rect(x, y, pad + 172, inputY, bw, bh2) ? 2 : 0);
+                int bw = IN_BW_SMALL, bh2 = IN_BH;
+                focusBox = in_rect(x, y, pad + IN_H_OFF, inputY, bw, bh2) ? 1
+                         : (in_rect(x, y, pad + IN_M_OFF, inputY, bw, bh2) ? 2 : 0);
             } else {
-                int bw = 96, bh2 = 36;
-                focusBox = in_rect(x, y, pad + 100, inputY, bw, bh2) ? 3 : 0;
+                int bw = IN_BW_BIG, bh2 = IN_BH;
+                focusBox = in_rect(x, y, pad + IN_T_OFF, inputY, bw, bh2) ? 3 : 0;
                 if (focusBox == 3 && wcscmp(bufT, L"2300") == 0) bufT[0] = 0;
             }
             if (running) focusBox = 0;
-            InvalidateRect(hwnd, NULL, TRUE);
+            RenderWindow(hwnd);
         }
         return 0;
     }
@@ -335,7 +431,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         int hm1 = in_rect(x, y, Wd2 / 2 + pad / 2, modeY, mw, modeH);
         if (hs != hoverStart || hc != hoverCancel || hm0 != hoverMode[0] || hm1 != hoverMode[1]) {
             hoverStart = hs; hoverCancel = hc; hoverMode[0] = hm0; hoverMode[1] = hm1;
-            InvalidateRect(hwnd, NULL, TRUE);
+            RenderWindow(hwnd);
         }
         return 0;
     }
@@ -350,11 +446,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     case WM_CHAR:
         if (exiting) return 0;
         if (!running) input_char((wchar_t)wParam);
-        InvalidateRect(hwnd, NULL, TRUE);
+        RenderWindow(hwnd);
         return 0;
     case WM_KEYDOWN:
         if (exiting) return 0;
-        if (wParam == VK_BACK) { if (!running) input_backspace(); InvalidateRect(hwnd, NULL, TRUE); }
+        if (wParam == VK_BACK) { if (!running) input_backspace(); RenderWindow(hwnd); }
         else if (wParam == VK_RETURN) { if (!running) start_task(hwnd); }
         else if (wParam == VK_ESCAPE) {
             cancel_exit(hwnd);   /* ESC = 结束程序（运行中先中止任务） */
@@ -371,7 +467,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 KillTimer(hwnd, ID_TIMER);
                 do_shutdown();
             }
-            InvalidateRect(hwnd, NULL, TRUE);
+            RenderWindow(hwnd);
         }
         return 0;
     case WM_CLOSE:
@@ -428,6 +524,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int nShow) {
         return selftest() ? 0 : 1;
     }
 
+    GdiplusStartupInput gsi; ULONG_PTR gdipToken = 0;
+    ZeroMemory(&gsi, sizeof(gsi)); gsi.GdiplusVersion = 1;
+    GdiplusStartup(&gdipToken, &gsi, NULL);
+
     WNDCLASSW wc = {0};
     wc.lpfnWndProc   = WndProc;
     wc.hInstance     = hInst;
@@ -446,12 +546,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int nShow) {
 
     int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
     int WX = sw / 3, WY = sh / 3;
-    HWND hwnd = CreateWindowExW(WS_EX_TOPMOST, L"ShutdownTimerWnd2", L"定时关机工具",
+    g_radius = 44 * g_scale / 100;
+    HWND hwnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_LAYERED, L"ShutdownTimerWnd2", L"定时关机工具",
         WS_POPUP, (sw - WX) / 2, (sh - WY) / 2, WX, WY, NULL, NULL, hInst, NULL);
-    if (hwnd) {
-        HRGN rgn = CreateRoundRectRgn(0, 0, WX + 1, WY + 1, 44, 44);
-        SetWindowRgn(hwnd, rgn, TRUE);
-    }
+    if (!hwnd) { GdiplusShutdown(gdipToken); return 1; }
+    RenderWindow(hwnd);
     ShowWindow(hwnd, nShow);
     UpdateWindow(hwnd);
 
@@ -460,5 +559,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrev, PWSTR cmd, int nShow) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    GdiplusShutdown(gdipToken);
     return 0;
 }
